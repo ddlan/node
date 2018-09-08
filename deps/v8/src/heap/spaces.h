@@ -110,7 +110,7 @@ class Space;
 // Some assertion macros used in the debugging mode.
 
 #define DCHECK_PAGE_ALIGNED(address) \
-  DCHECK((OffsetFrom(address) & Page::kPageAlignmentMask) == 0)
+  DCHECK((OffsetFrom(address) & kPageAlignmentMask) == 0)
 
 #define DCHECK_OBJECT_ALIGNED(address) \
   DCHECK((OffsetFrom(address) & kObjectAlignmentMask) == 0)
@@ -312,7 +312,11 @@ class MemoryChunk {
 
     // |SWEEP_TO_ITERATE|: The page requires sweeping using external markbits
     // to iterate the page.
-    SWEEP_TO_ITERATE = 1u << 17
+    SWEEP_TO_ITERATE = 1u << 17,
+
+    // |INCREMENTAL_MARKING|: Indicates whether incremental marking is currently
+    // enabled.
+    INCREMENTAL_MARKING = 1u << 18
   };
 
   using Flags = uintptr_t;
@@ -359,7 +363,7 @@ class MemoryChunk {
       + kUIntptrSize      // uintptr_t flags_
       + kPointerSize      // Address area_start_
       + kPointerSize      // Address area_end_
-      + 2 * kPointerSize  // VirtualMemory reservation_
+      + 3 * kPointerSize  // VirtualMemory reservation_
       + kPointerSize      // Address owner_
       + kPointerSize      // Heap* heap_
       + kIntptrSize       // intptr_t progress_bar_
@@ -403,7 +407,6 @@ class MemoryChunk {
 
   // Page size in bytes.  This must be a multiple of the OS page size.
   static const int kPageSize = 1 << kPageSizeBits;
-  static const intptr_t kPageAlignmentMask = (1 << kPageSizeBits) - 1;
 
   static const int kAllocatableMemory = kPageSize - kObjectStartOffset;
 
@@ -512,6 +515,9 @@ class MemoryChunk {
   InvalidatedSlots* AllocateInvalidatedSlots();
   void ReleaseInvalidatedSlots();
   void RegisterObjectWithInvalidatedSlots(HeapObject* object, int size);
+  // Updates invalidated_slots after array left-trimming.
+  void MoveObjectWithInvalidatedSlots(HeapObject* old_start,
+                                      HeapObject* new_start);
   InvalidatedSlots* invalidated_slots() { return invalidated_slots_; }
 
   void ReleaseLocalTracker();
@@ -623,6 +629,10 @@ class MemoryChunk {
 
   bool InFromSpace() { return IsFlagSet(IN_FROM_SPACE); }
 
+  bool InOldSpace() const;
+
+  bool InLargeObjectSpace() const;
+
   Space* owner() const { return owner_; }
 
   void set_owner(Space* space) { owner_ = space; }
@@ -642,7 +652,7 @@ class MemoryChunk {
   static MemoryChunk* Initialize(Heap* heap, Address base, size_t size,
                                  Address area_start, Address area_end,
                                  Executability executable, Space* owner,
-                                 VirtualMemory* reservation);
+                                 VirtualMemory&& reservation);
 
   // Should be called when memory chunk is about to be freed.
   void ReleaseAllocatedMemory();
@@ -758,13 +768,18 @@ class Page : public MemoryChunk {
   // Page flags copied from from-space to to-space when flipping semispaces.
   static const intptr_t kCopyOnFlipFlagsMask =
       static_cast<intptr_t>(MemoryChunk::POINTERS_TO_HERE_ARE_INTERESTING) |
-      static_cast<intptr_t>(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING);
+      static_cast<intptr_t>(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING) |
+      static_cast<intptr_t>(MemoryChunk::INCREMENTAL_MARKING);
 
   // Returns the page containing a given address. The address ranges
   // from [page_addr .. page_addr + kPageSize[. This only works if the object
   // is in fact in a page.
   static Page* FromAddress(Address addr) {
     return reinterpret_cast<Page*>(OffsetFrom(addr) & ~kPageAlignmentMask);
+  }
+  static Page* FromHeapObject(const HeapObject* o) {
+    return reinterpret_cast<Page*>(reinterpret_cast<Address>(o) &
+                                   ~kAlignmentMask);
   }
 
   // Returns the page containing the address provided. The address can
@@ -879,6 +894,9 @@ class ReadOnlyPage : public Page {
   // Clears any pointers in the header that point out of the page that would
   // otherwise make the header non-relocatable.
   void MakeHeaderRelocatable();
+
+ private:
+  friend class ReadOnlySpace;
 };
 
 class LargePage : public MemoryChunk {
@@ -1068,7 +1086,8 @@ class MemoryChunkValidator {
 // manages a range of virtual memory.
 class CodeRange {
  public:
-  CodeRange(Isolate* isolate, size_t requested_size);
+  CodeRange(Isolate* isolate, v8::PageAllocator* page_allocator,
+            size_t requested_size);
   ~CodeRange();
 
   bool valid() { return virtual_memory_.IsReserved(); }
@@ -1196,7 +1215,7 @@ class SkipList {
   }
 
   static inline int RegionNumber(Address addr) {
-    return (OffsetFrom(addr) & Page::kPageAlignmentMask) >> kRegionSizeLog2;
+    return (OffsetFrom(addr) & kPageAlignmentMask) >> kRegionSizeLog2;
   }
 
   static void Update(Address addr, int size) {
@@ -1407,8 +1426,6 @@ class V8_EXPORT_PRIVATE MemoryAllocator {
   MemoryChunk* AllocateChunk(size_t reserve_area_size, size_t commit_area_size,
                              Executability executable, Space* space);
 
-  Address ReserveAlignedMemory(size_t requested, size_t alignment, void* hint,
-                               VirtualMemory* controller);
   Address AllocateAlignedMemory(size_t reserve_size, size_t commit_size,
                                 size_t alignment, Executability executable,
                                 void* hint, VirtualMemory* controller);
@@ -1441,7 +1458,7 @@ class V8_EXPORT_PRIVATE MemoryAllocator {
   // start is not kNullAddress, the size is greater than zero, and the
   // block is contained in the initial chunk.  Returns true if it succeeded
   // and false otherwise.
-  bool UncommitBlock(Address start, size_t size);
+  bool UncommitBlock(VirtualMemory* reservation, Address start, size_t size);
 
   // Zaps a contiguous block of memory [start..(start+size)[ with
   // a given zap value.
@@ -1451,6 +1468,21 @@ class V8_EXPORT_PRIVATE MemoryAllocator {
                                                     Address start,
                                                     size_t commit_size,
                                                     size_t reserved_size);
+
+  // Page allocator instance for allocating non-executable pages.
+  // Guaranteed to be a valid pointer.
+  v8::PageAllocator* data_page_allocator() { return data_page_allocator_; }
+
+  // Page allocator instance for allocating executable pages.
+  // Guaranteed to be a valid pointer.
+  v8::PageAllocator* code_page_allocator() { return code_page_allocator_; }
+
+  // Returns page allocator suitable for allocating pages with requested
+  // executability.
+  v8::PageAllocator* page_allocator(Executability executable) {
+    return executable == EXECUTABLE ? code_page_allocator_
+                                    : data_page_allocator_;
+  }
 
   CodeRange* code_range() { return code_range_; }
   Unmapper* unmapper() { return &unmapper_; }
@@ -1503,6 +1535,10 @@ class V8_EXPORT_PRIVATE MemoryAllocator {
   }
 
   Isolate* isolate_;
+
+  v8::PageAllocator* data_page_allocator_;
+  v8::PageAllocator* code_page_allocator_;
+
   CodeRange* code_range_;
 
   // Maximum space size in bytes.
@@ -1990,7 +2026,10 @@ class LocalAllocationBuffer {
   // Indicates that a buffer cannot be used for allocations anymore. Can result
   // from either reassigning a buffer, or trying to construct it from an
   // invalid {AllocationResult}.
-  static inline LocalAllocationBuffer InvalidBuffer();
+  static LocalAllocationBuffer InvalidBuffer() {
+    return LocalAllocationBuffer(
+        nullptr, LinearAllocationArea(kNullAddress, kNullAddress));
+  }
 
   // Creates a new LAB from a given {AllocationResult}. Results in
   // InvalidBuffer if the result indicates a retry.
@@ -2586,8 +2625,8 @@ class NewSpace : public SpaceWithLinearArea {
  public:
   typedef PageIterator iterator;
 
-  NewSpace(Heap* heap, size_t initial_semispace_capacity,
-           size_t max_semispace_capacity);
+  NewSpace(Heap* heap, v8::PageAllocator* page_allocator,
+           size_t initial_semispace_capacity, size_t max_semispace_capacity);
 
   ~NewSpace() override { TearDown(); }
 

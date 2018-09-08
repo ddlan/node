@@ -90,6 +90,11 @@ static void VerifyMemoryChunk(Isolate* isolate, Heap* heap,
     TestMemoryAllocatorScope test_allocator_scope(isolate, memory_allocator);
     TestCodeRangeScope test_code_range_scope(isolate, code_range);
 
+    v8::PageAllocator* data_page_allocator =
+        memory_allocator->data_page_allocator();
+    v8::PageAllocator* code_page_allocator =
+        memory_allocator->code_page_allocator();
+
     size_t header_size = (executable == EXECUTABLE)
                              ? MemoryAllocator::CodePageGuardStartOffset()
                              : MemoryChunk::kObjectStartOffset;
@@ -100,12 +105,13 @@ static void VerifyMemoryChunk(Isolate* isolate, Heap* heap,
         reserve_area_size, commit_area_size, executable, space);
     size_t alignment = code_range != nullptr && code_range->valid()
                            ? MemoryChunk::kAlignment
-                           : CommitPageSize();
+                           : code_page_allocator->CommitPageSize();
     size_t reserved_size =
         ((executable == EXECUTABLE))
             ? RoundUp(header_size + guard_size + reserve_area_size + guard_size,
                       alignment)
-            : RoundUp(header_size + reserve_area_size, CommitPageSize());
+            : RoundUp(header_size + reserve_area_size,
+                      data_page_allocator->CommitPageSize());
     CHECK(memory_chunk->size() == reserved_size);
     CHECK(memory_chunk->area_start() <
           memory_chunk->address() + memory_chunk->size());
@@ -127,7 +133,8 @@ TEST(Regress3540) {
   TestMemoryAllocatorScope test_allocator_scope(isolate, memory_allocator);
   size_t code_range_size =
       kMinimumCodeRangeSize > 0 ? kMinimumCodeRangeSize : 3 * Page::kPageSize;
-  CodeRange* code_range = new CodeRange(isolate, code_range_size);
+  CodeRange* code_range = new CodeRange(
+      isolate, memory_allocator->code_page_allocator(), code_range_size);
 
   Address address;
   size_t size;
@@ -162,16 +169,19 @@ TEST(MemoryChunk) {
   Isolate* isolate = CcTest::i_isolate();
   Heap* heap = isolate->heap();
 
+  v8::PageAllocator* page_allocator = GetPlatformPageAllocator();
+
   size_t reserve_area_size = 1 * MB;
   size_t initial_commit_area_size;
 
   for (int i = 0; i < 100; i++) {
     initial_commit_area_size =
-        RoundUp(PseudorandomAreaSize(), CommitPageSize());
+        RoundUp(PseudorandomAreaSize(), page_allocator->CommitPageSize());
 
     // With CodeRange.
     const size_t code_range_size = 32 * MB;
-    CodeRange* code_range = new CodeRange(isolate, code_range_size);
+    CodeRange* code_range =
+        new CodeRange(isolate, page_allocator, code_range_size);
 
     VerifyMemoryChunk(isolate, heap, code_range, reserve_area_size,
                       initial_commit_area_size, EXECUTABLE, heap->code_space());
@@ -240,7 +250,8 @@ TEST(NewSpace) {
       new MemoryAllocator(isolate, heap->MaxReserved(), 0);
   TestMemoryAllocatorScope test_scope(isolate, memory_allocator);
 
-  NewSpace new_space(heap, CcTest::heap()->InitialSemiSpaceSize(),
+  NewSpace new_space(heap, memory_allocator->data_page_allocator(),
+                     CcTest::heap()->InitialSemiSpaceSize(),
                      CcTest::heap()->InitialSemiSpaceSize());
   CHECK(new_space.MaximumCapacity());
 

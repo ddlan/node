@@ -17,10 +17,13 @@
 #include "src/heap/heap-controller.h"
 #include "src/heap/incremental-marking.h"
 #include "src/heap/mark-compact.h"
+#include "src/heap/remembered-set.h"
 #include "src/heap/slot-set.h"
 #include "src/heap/sweeper.h"
 #include "src/msan.h"
 #include "src/objects-inl.h"
+#include "src/objects/js-array-buffer-inl.h"
+#include "src/objects/js-array-inl.h"
 #include "src/snapshot/snapshot.h"
 #include "src/v8.h"
 #include "src/vm-state-inl.h"
@@ -97,7 +100,8 @@ PauseAllocationObserversScope::~PauseAllocationObserversScope() {
 static base::LazyInstance<CodeRangeAddressHint>::type code_range_address_hint =
     LAZY_INSTANCE_INITIALIZER;
 
-CodeRange::CodeRange(Isolate* isolate, size_t requested)
+CodeRange::CodeRange(Isolate* isolate, v8::PageAllocator* page_allocator,
+                     size_t requested)
     : isolate_(isolate),
       free_list_(0),
       allocation_list_(0),
@@ -132,8 +136,9 @@ CodeRange::CodeRange(Isolate* isolate, size_t requested)
   VirtualMemory reservation;
   void* hint = code_range_address_hint.Pointer()->GetAddressHint(requested);
   if (!AlignedAllocVirtualMemory(
-          requested, Max(kCodeRangeAreaAlignment, AllocatePageSize()), hint,
-          &reservation)) {
+          page_allocator, requested,
+          Max(kCodeRangeAreaAlignment, page_allocator->AllocatePageSize()),
+          hint, &reservation)) {
     V8::FatalProcessOutOfMemory(isolate,
                                 "CodeRange setup: allocate virtual memory");
   }
@@ -301,6 +306,8 @@ void CodeRangeAddressHint::NotifyFreedCodeRange(void* code_range_start,
 MemoryAllocator::MemoryAllocator(Isolate* isolate, size_t capacity,
                                  size_t code_range_size)
     : isolate_(isolate),
+      data_page_allocator_(GetPlatformPageAllocator()),
+      code_page_allocator_(GetPlatformPageAllocator()),
       code_range_(nullptr),
       capacity_(RoundUp(capacity, Page::kPageSize)),
       size_(0),
@@ -308,7 +315,7 @@ MemoryAllocator::MemoryAllocator(Isolate* isolate, size_t capacity,
       lowest_ever_allocated_(static_cast<Address>(-1ll)),
       highest_ever_allocated_(kNullAddress),
       unmapper_(isolate->heap(), this) {
-  code_range_ = new CodeRange(isolate_, code_range_size);
+  code_range_ = new CodeRange(isolate_, code_page_allocator_, code_range_size);
 }
 
 
@@ -487,7 +494,9 @@ size_t MemoryAllocator::Unmapper::CommittedBufferedMemory() {
 }
 
 bool MemoryAllocator::CommitMemory(Address base, size_t size) {
-  if (!SetPermissions(base, size, PageAllocator::kReadWrite)) {
+  // TODO(ishell): use proper page allocator
+  if (!SetPermissions(GetPlatformPageAllocator(), base, size,
+                      PageAllocator::kReadWrite)) {
     return false;
   }
   UpdateAllocatedSpaceLimits(base, base + size);
@@ -496,7 +505,7 @@ bool MemoryAllocator::CommitMemory(Address base, size_t size) {
 
 void MemoryAllocator::FreeMemory(VirtualMemory* reservation,
                                  Executability executable) {
-  // TODO(gc) make code_range part of memory allocator?
+  // TODO(ishell): make code_range part of memory allocator?
   // Code which is part of the code-range does not have its own VirtualMemory.
   DCHECK(code_range() == nullptr ||
          !code_range()->contains(reservation->address()));
@@ -509,38 +518,28 @@ void MemoryAllocator::FreeMemory(VirtualMemory* reservation,
 
 void MemoryAllocator::FreeMemory(Address base, size_t size,
                                  Executability executable) {
-  // TODO(gc) make code_range part of memory allocator?
+  // TODO(ishell): make code_range part of memory allocator?
   if (code_range() != nullptr && code_range()->contains(base)) {
     DCHECK(executable == EXECUTABLE);
     code_range()->FreeRawMemory(base, size);
   } else {
     DCHECK(executable == NOT_EXECUTABLE || !code_range()->valid());
-    CHECK(FreePages(reinterpret_cast<void*>(base), size));
+    CHECK(FreePages(data_page_allocator_, reinterpret_cast<void*>(base), size));
   }
-}
-
-Address MemoryAllocator::ReserveAlignedMemory(size_t size, size_t alignment,
-                                              void* hint,
-                                              VirtualMemory* controller) {
-  VirtualMemory reservation;
-  if (!AlignedAllocVirtualMemory(size, alignment, hint, &reservation)) {
-    return kNullAddress;
-  }
-
-  Address result = reservation.address();
-  size_ += reservation.size();
-  controller->TakeControl(&reservation);
-  return result;
 }
 
 Address MemoryAllocator::AllocateAlignedMemory(
     size_t reserve_size, size_t commit_size, size_t alignment,
     Executability executable, void* hint, VirtualMemory* controller) {
+  v8::PageAllocator* page_allocator = this->page_allocator(executable);
   DCHECK(commit_size <= reserve_size);
   VirtualMemory reservation;
-  Address base =
-      ReserveAlignedMemory(reserve_size, alignment, hint, &reservation);
-  if (base == kNullAddress) return kNullAddress;
+  if (!AlignedAllocVirtualMemory(page_allocator, reserve_size, alignment, hint,
+                                 &reservation)) {
+    return kNullAddress;
+  }
+  Address base = reservation.address();
+  size_ += reservation.size();
 
   if (executable == EXECUTABLE) {
     if (!CommitExecutableMemory(&reservation, base, commit_size,
@@ -605,7 +604,11 @@ void MemoryChunk::SetReadAndExecutable() {
     size_t page_size = MemoryAllocator::GetCommitPageSize();
     DCHECK(IsAddressAligned(protect_start, page_size));
     size_t protect_size = RoundUp(area_size(), page_size);
-    CHECK(SetPermissions(protect_start, protect_size,
+    // TODO(ishell): use reservation_.SetPermissions() once it's always
+    // initialized.
+    v8::PageAllocator* page_allocator =
+        heap()->memory_allocator()->code_page_allocator();
+    CHECK(SetPermissions(page_allocator, protect_start, protect_size,
                          PageAllocator::kReadExecute));
   }
 }
@@ -624,7 +627,11 @@ void MemoryChunk::SetReadAndWritable() {
     size_t page_size = MemoryAllocator::GetCommitPageSize();
     DCHECK(IsAddressAligned(unprotect_start, page_size));
     size_t unprotect_size = RoundUp(area_size(), page_size);
-    CHECK(SetPermissions(unprotect_start, unprotect_size,
+    // TODO(ishell): use reservation_.SetPermissions() once it's always
+    // initialized.
+    v8::PageAllocator* page_allocator =
+        heap()->memory_allocator()->code_page_allocator();
+    CHECK(SetPermissions(page_allocator, unprotect_start, unprotect_size,
                          PageAllocator::kReadWrite));
   }
 }
@@ -632,7 +639,7 @@ void MemoryChunk::SetReadAndWritable() {
 MemoryChunk* MemoryChunk::Initialize(Heap* heap, Address base, size_t size,
                                      Address area_start, Address area_end,
                                      Executability executable, Space* owner,
-                                     VirtualMemory* reservation) {
+                                     VirtualMemory&& reservation) {
   MemoryChunk* chunk = FromAddress(base);
 
   DCHECK(base == chunk->address());
@@ -693,14 +700,16 @@ MemoryChunk* MemoryChunk::Initialize(Heap* heap, Address base, size_t size,
       size_t page_size = MemoryAllocator::GetCommitPageSize();
       DCHECK(IsAddressAligned(area_start, page_size));
       size_t area_size = RoundUp(area_end - area_start, page_size);
-      CHECK(SetPermissions(area_start, area_size,
+      // TODO(ishell): use reservation->SetPermissions() once it's always
+      // initialized.
+      v8::PageAllocator* page_allocator =
+          heap->memory_allocator()->page_allocator(executable);
+      CHECK(SetPermissions(page_allocator, area_start, area_size,
                            PageAllocator::kReadWriteExecute));
     }
   }
 
-  if (reservation != nullptr) {
-    chunk->reservation_.TakeControl(reservation);
-  }
+  chunk->reservation_ = std::move(reservation);
 
   return chunk;
 }
@@ -797,6 +806,14 @@ size_t MemoryChunk::CommittedPhysicalMemory() {
 
 bool MemoryChunk::IsPagedSpace() const {
   return owner()->identity() != LO_SPACE;
+}
+
+bool MemoryChunk::InOldSpace() const {
+  return owner()->identity() == OLD_SPACE;
+}
+
+bool MemoryChunk::InLargeObjectSpace() const {
+  return owner()->identity() == LO_SPACE;
 }
 
 MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
@@ -917,7 +934,7 @@ MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
   if ((base + chunk_size) == 0u) {
     CHECK(!last_chunk_.IsReserved());
     last_chunk_.TakeControl(&reservation);
-    UncommitBlock(last_chunk_.address(), last_chunk_.size());
+    UncommitBlock(&last_chunk_, last_chunk_.address(), last_chunk_.size());
     size_ -= chunk_size;
     if (executable == EXECUTABLE) {
       size_executable_ -= chunk_size;
@@ -929,7 +946,7 @@ MemoryChunk* MemoryAllocator::AllocateChunk(size_t reserve_area_size,
 
   MemoryChunk* chunk =
       MemoryChunk::Initialize(heap, base, chunk_size, area_start, area_end,
-                              executable, owner, &reservation);
+                              executable, owner, std::move(reservation));
 
   if (chunk->executable()) RegisterExecutableMemoryChunk(chunk);
   return chunk;
@@ -939,9 +956,11 @@ void MemoryChunk::SetOldGenerationPageFlags(bool is_marking) {
   if (is_marking) {
     SetFlag(MemoryChunk::POINTERS_TO_HERE_ARE_INTERESTING);
     SetFlag(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING);
+    SetFlag(MemoryChunk::INCREMENTAL_MARKING);
   } else {
     ClearFlag(MemoryChunk::POINTERS_TO_HERE_ARE_INTERESTING);
     SetFlag(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING);
+    ClearFlag(MemoryChunk::INCREMENTAL_MARKING);
   }
 }
 
@@ -949,8 +968,10 @@ void MemoryChunk::SetYoungGenerationPageFlags(bool is_marking) {
   SetFlag(MemoryChunk::POINTERS_TO_HERE_ARE_INTERESTING);
   if (is_marking) {
     SetFlag(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING);
+    SetFlag(MemoryChunk::INCREMENTAL_MARKING);
   } else {
     ClearFlag(MemoryChunk::POINTERS_FROM_HERE_ARE_INTERESTING);
+    ClearFlag(MemoryChunk::INCREMENTAL_MARKING);
   }
 }
 
@@ -1113,7 +1134,8 @@ void MemoryAllocator::PerformFreeMemory(MemoryChunk* chunk) {
 
   VirtualMemory* reservation = chunk->reserved_memory();
   if (chunk->IsFlagSet(MemoryChunk::POOLED)) {
-    UncommitBlock(reinterpret_cast<Address>(chunk), MemoryChunk::kPageSize);
+    UncommitBlock(reservation, reinterpret_cast<Address>(chunk),
+                  MemoryChunk::kPageSize);
   } else {
     if (reservation->IsReserved()) {
       FreeMemory(reservation, chunk->executable());
@@ -1204,9 +1226,9 @@ MemoryChunk* MemoryAllocator::AllocatePagePooled(SpaceType* owner) {
   if (!CommitBlock(start, size)) {
     return nullptr;
   }
-  VirtualMemory reservation(start, size);
+  VirtualMemory reservation(data_page_allocator(), start, size);
   MemoryChunk::Initialize(isolate_->heap(), start, size, area_start, area_end,
-                          NOT_EXECUTABLE, owner, &reservation);
+                          NOT_EXECUTABLE, owner, std::move(reservation));
   size_ += size;
   return chunk;
 }
@@ -1222,9 +1244,13 @@ bool MemoryAllocator::CommitBlock(Address start, size_t size) {
   return true;
 }
 
-
-bool MemoryAllocator::UncommitBlock(Address start, size_t size) {
-  if (!SetPermissions(start, size, PageAllocator::kNoAccess)) return false;
+bool MemoryAllocator::UncommitBlock(VirtualMemory* reservation, Address start,
+                                    size_t size) {
+  // TODO(ishell): use reservation->SetPermissions() once it's always
+  // initialized.
+  if (!SetPermissions(reservation->page_allocator(), start, size,
+                      PageAllocator::kNoAccess))
+    return false;
   isolate_->counters()->memory_allocated()->Decrement(static_cast<int>(size));
   return true;
 }
@@ -1234,7 +1260,7 @@ void MemoryAllocator::ZapBlock(Address start, size_t size,
   DCHECK_EQ(start % kPointerSize, 0);
   DCHECK_EQ(size % kPointerSize, 0);
   for (size_t s = 0; s + kPointerSize <= size; s += kPointerSize) {
-    Memory::Address_at(start + s) = static_cast<Address>(zap_value);
+    Memory<Address>(start + s) = static_cast<Address>(zap_value);
   }
 }
 
@@ -1423,6 +1449,22 @@ void MemoryChunk::RegisterObjectWithInvalidatedSlots(HeapObject* object,
     }
     int old_size = (*invalidated_slots())[object];
     (*invalidated_slots())[object] = std::max(old_size, size);
+  }
+}
+
+void MemoryChunk::MoveObjectWithInvalidatedSlots(HeapObject* old_start,
+                                                 HeapObject* new_start) {
+  DCHECK_LT(old_start, new_start);
+  DCHECK_EQ(MemoryChunk::FromHeapObject(old_start),
+            MemoryChunk::FromHeapObject(new_start));
+  if (!ShouldSkipEvacuationSlotRecording() && invalidated_slots()) {
+    auto it = invalidated_slots()->find(old_start);
+    if (it != invalidated_slots()->end()) {
+      int old_size = it->second;
+      int delta = static_cast<int>(new_start->address() - old_start->address());
+      invalidated_slots()->erase(it);
+      (*invalidated_slots())[new_start] = old_size - delta;
+    }
   }
 }
 
@@ -1989,7 +2031,11 @@ void PagedSpace::Verify(Isolate* isolate, ObjectVisitor* visitor) {
       CHECK(object->address() + size <= top);
       end_of_previous_object = object->address() + size;
 
-      if (object->IsJSArrayBuffer()) {
+      if (object->IsExternalString()) {
+        ExternalString* external_string = ExternalString::cast(object);
+        size_t size = external_string->ExternalPayloadSize();
+        external_page_bytes[ExternalBackingStoreType::kExternalString] += size;
+      } else if (object->IsJSArrayBuffer()) {
         JSArrayBuffer* array_buffer = JSArrayBuffer::cast(object);
         if (ArrayBufferTracker::IsTracked(array_buffer)) {
           size_t size = NumberToSize(array_buffer->byte_length());
@@ -2084,12 +2130,12 @@ void PagedSpace::VerifyCountersBeforeConcurrentSweeping() {
 // -----------------------------------------------------------------------------
 // NewSpace implementation
 
-NewSpace::NewSpace(Heap* heap, size_t initial_semispace_capacity,
+NewSpace::NewSpace(Heap* heap, v8::PageAllocator* page_allocator,
+                   size_t initial_semispace_capacity,
                    size_t max_semispace_capacity)
     : SpaceWithLinearArea(heap, NEW_SPACE),
       to_space_(heap, kToSpace),
-      from_space_(heap, kFromSpace),
-      reservation_() {
+      from_space_(heap, kFromSpace) {
   DCHECK(initial_semispace_capacity <= max_semispace_capacity);
   DCHECK(
       base::bits::IsPowerOfTwo(static_cast<uint32_t>(max_semispace_capacity)));
@@ -2473,7 +2519,11 @@ void NewSpace::Verify(Isolate* isolate) {
       int size = object->Size();
       object->IterateBody(map, size, &visitor);
 
-      if (object->IsJSArrayBuffer()) {
+      if (object->IsExternalString()) {
+        ExternalString* external_string = ExternalString::cast(object);
+        size_t size = external_string->ExternalPayloadSize();
+        external_space_bytes[ExternalBackingStoreType::kExternalString] += size;
+      } else if (object->IsJSArrayBuffer()) {
         JSArrayBuffer* array_buffer = JSArrayBuffer::cast(object);
         if (ArrayBufferTracker::IsTracked(array_buffer)) {
           size_t size = NumberToSize(array_buffer->byte_length());
@@ -2574,7 +2624,7 @@ bool SemiSpace::GrowTo(size_t new_capacity) {
   if (!is_committed()) {
     if (!Commit()) return false;
   }
-  DCHECK_EQ(new_capacity & Page::kPageAlignmentMask, 0u);
+  DCHECK_EQ(new_capacity & kPageAlignmentMask, 0u);
   DCHECK_LE(new_capacity, maximum_capacity_);
   DCHECK_GT(new_capacity, current_capacity_);
   const size_t delta = new_capacity - current_capacity_;
@@ -2613,7 +2663,7 @@ void SemiSpace::RewindPages(int num_pages) {
 }
 
 bool SemiSpace::ShrinkTo(size_t new_capacity) {
-  DCHECK_EQ(new_capacity & Page::kPageAlignmentMask, 0u);
+  DCHECK_EQ(new_capacity & kPageAlignmentMask, 0u);
   DCHECK_GE(new_capacity, minimum_capacity_);
   DCHECK_LT(new_capacity, current_capacity_);
   if (is_committed()) {
@@ -3303,7 +3353,13 @@ void ReadOnlySpace::SetPermissionsForPages(PageAllocator::Permission access) {
     if (access == PageAllocator::kRead) {
       page->MakeHeaderRelocatable();
     }
-    CHECK(SetPermissions(page->address() + area_start_offset,
+    // TODO(ishell): use page->reserved_memory()->SetPermissions() once it's
+    // always initialized.
+    v8::PageAllocator* page_allocator =
+        page->IsFlagSet(Page::IS_EXECUTABLE)
+            ? heap()->memory_allocator()->code_page_allocator()
+            : heap()->memory_allocator()->data_page_allocator();
+    CHECK(SetPermissions(page_allocator, page->address() + area_start_offset,
                          page->size() - area_start_offset, access));
   }
 }

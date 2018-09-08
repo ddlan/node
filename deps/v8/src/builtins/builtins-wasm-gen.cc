@@ -5,6 +5,7 @@
 #include "src/builtins/builtins-utils-gen.h"
 #include "src/code-stub-assembler.h"
 #include "src/objects-inl.h"
+#include "src/wasm/wasm-objects.h"
 #include "src/wasm/wasm-opcodes.h"
 
 namespace v8 {
@@ -62,7 +63,7 @@ TF_BUILTIN(WasmArgumentsAdaptor, WasmBuiltinsAssembler) {
   TNode<Object> argc2 = UncheckedParameter(Descriptor::kExpectedArgumentsCount);
   TNode<Code> target =
       LoadBuiltinFromFrame(Builtins::kArgumentsAdaptorTrampoline);
-  TailCallStub(ArgumentAdaptorDescriptor{}, target, context, function,
+  TailCallStub(ArgumentsAdaptorDescriptor{}, target, context, function,
                new_target, argc1, argc2);
 }
 
